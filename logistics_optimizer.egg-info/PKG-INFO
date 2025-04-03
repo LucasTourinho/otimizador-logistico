@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: logistics_optimizer
+Version: 0.1
+Requires-Dist: streamlit
+Requires-Dist: pandas
+Requires-Dist: folium
+Requires-Dist: streamlit-folium
+Requires-Dist: pulp
+Requires-Dist: scikit-learn
+Requires-Dist: numpy
+Dynamic: requires-dist
