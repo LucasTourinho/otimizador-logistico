@@ -10,6 +10,7 @@ from models.factory import Factory
 from optimizer.route_optimizer import RouteOptimizer
 from typing import List, Dict, Any
 import math
+import streamlit as st
 
 class LogisticsOptimizer:
     def __init__(self, pdv_data: pd.DataFrame, transport_data: pd.DataFrame, cd_data: pd.DataFrame, factories: List[Factory]):
@@ -40,183 +41,243 @@ class LogisticsOptimizer:
         c = 2 * np.arcsin(np.sqrt(a))
         return R * c
 
-    def find_best_vehicle_mix(self, cluster_points: pd.DataFrame, route_optimizer: RouteOptimizer) -> Dict:
+    def find_best_vehicle_mix(self, cluster_points: pd.DataFrame, route_optimizer: RouteOptimizer, fixed_fleet=None) -> Dict:
         """
-        Encontra o veículo mais adequado baseado na demanda média esperada.
+        Encontra o melhor mix de veículos ou usa a frota fixa definida pelo usuário.
         
         Args:
             cluster_points: DataFrame com os pontos de venda do cluster
             route_optimizer: Otimizador de rotas para o cluster
-        
-        Returns:
-            Dicionário com informações do melhor mix de veículos
+            fixed_fleet: DataFrame com a frota fixa definida pelo usuário
         """
-        # Se não há pontos, retorna None
         if len(cluster_points) == 0:
             return None
+
+        if fixed_fleet is not None:
+            # Usa a frota definida pelo usuário
+            total_cost = 0
+            vehicles_used = {}
+            all_routes = []
+
+            # Para cada tipo de veículo definido pelo usuário
+            for _, row in fixed_fleet.iterrows():
+                if row['Quantidade'] > 0:
+                    # Obtém dados do veículo
+                    vehicle_data = self.transport_data[self.transport_data['Modal'] == row['Modal']].iloc[0]
+                    
+                    # Tenta criar rotas com este veículo
+                    routes = route_optimizer.optimize_routes(
+                        vehicle_capacity=vehicle_data['Capacidade por entrega (kg)'],
+                        max_stops_per_day=8
+                    )
+                    
+                    if routes:
+                        # Calcula custos variáveis (km rodado)
+                        route_cost = 0
+                        for route in routes:
+                            costs = route_optimizer.calculate_route_costs(vehicle_data, route)
+                            route_cost += costs['variable']
+                        
+                        # Adiciona custo fixo da frota
+                        fixed_cost = row['Quantidade'] * vehicle_data['Custo fixo por mês']
+                        total_cost += route_cost + fixed_cost
+                        
+                        vehicles_used[row['Modal']] = {
+                            'count': row['Quantidade'],
+                            'routes': routes
+                        }
+                        all_routes.extend(routes)
+
+            if vehicles_used:
+                return {
+                    'routes': all_routes,
+                    'vehicles': vehicles_used,
+                    'total_cost': total_cost
+                }
+            return None
+
+        else:
+            # Calcula a demanda total e média por ponto
+            total_demand = cluster_points['demanda_kg'].sum()
+            avg_demand_per_point = total_demand / len(cluster_points)
             
-        # Calcula a demanda total e média por ponto
-        total_demand = cluster_points['demanda_kg'].sum()
-        avg_demand_per_point = total_demand / len(cluster_points)
-        
-        # Ordena veículos por capacidade (do maior para o menor)
-        vehicles = self.transport_data.sort_values('Capacidade por entrega (kg)', ascending=False)
-        
-        # Tenta encontrar o veículo mais adequado
-        for _, vehicle in vehicles.iterrows():
-            # Calcula quantos pontos podem ser atendidos por rota baseado na capacidade
-            max_stops_by_capacity = vehicle['Capacidade por entrega (kg)'] / avg_demand_per_point
+            # Ordena veículos por capacidade (do maior para o menor)
+            vehicles = self.transport_data.sort_values('Capacidade por entrega (kg)', ascending=False)
             
-            # Se o veículo pode fazer pelo menos 4 paradas por rota (aumentamos o mínimo)
-            if max_stops_by_capacity >= 4:
-                # Tenta roteirizar com este veículo
-                routes = route_optimizer.optimize_routes(
-                    vehicle_capacity=vehicle['Capacidade por entrega (kg)'],
-                    max_stops_per_day=8  # Fixamos em 8 paradas por rota
+            # Tenta encontrar o veículo mais adequado
+            for _, vehicle in vehicles.iterrows():
+                # Calcula quantos pontos podem ser atendidos por rota baseado na capacidade
+                max_stops_by_capacity = vehicle['Capacidade por entrega (kg)'] / avg_demand_per_point
+                
+                # Se o veículo pode fazer pelo menos 4 paradas por rota (aumentamos o mínimo)
+                if max_stops_by_capacity >= 4:
+                    # Tenta roteirizar com este veículo
+                    routes = route_optimizer.optimize_routes(
+                        vehicle_capacity=vehicle['Capacidade por entrega (kg)'],
+                        max_stops_per_day=8  # Fixamos em 8 paradas por rota
+                    )
+                    
+                    if routes:
+                        # Verifica se as rotas estão eficientes (média de paradas >= 3)
+                        avg_stops_per_route = sum(len(route) for route in routes) / len(routes)
+                        if avg_stops_per_route < 3:
+                            continue
+                        
+                        # Calcula custos
+                        total_cost = 0
+                        for route in routes:
+                            costs = route_optimizer.calculate_route_costs(vehicle, route)
+                            total_cost += costs['variable']
+                        
+                        # Adiciona custo fixo pelo número de veículos necessários
+                        deliveries_per_month = vehicle['Nº entrega por mês']
+                        num_vehicles = math.ceil(len(routes) / (deliveries_per_month))
+                        total_cost += num_vehicles * vehicle['Custo fixo por mês']
+                        
+                        # Retorna a solução
+                        return {
+                            'routes': routes,
+                            'vehicles': {
+                                vehicle['Modal']: {
+                                    'count': num_vehicles,
+                                    'routes': routes
+                                }
+                            },
+                            'total_cost': total_cost
+                        }
+            
+            # Se nenhum veículo funcionou com rotas eficientes, tenta novamente com critérios mais flexíveis
+            vehicle = vehicles.iloc[0]  # Pega o maior veículo
+            routes = route_optimizer.optimize_routes(
+                vehicle_capacity=vehicle['Capacidade por entrega (kg)'],
+                max_stops_per_day=8  # Mantém 8 paradas por rota
+            )
+            
+            if routes:
+                # Calcula custos
+                total_cost = 0
+                for route in routes:
+                    costs = route_optimizer.calculate_route_costs(vehicle, route)
+                    total_cost += costs['variable']
+                
+                # Adiciona custo fixo pelo número de veículos necessários
+                deliveries_per_month = vehicle['Nº entrega por mês']
+                num_vehicles = math.ceil(len(routes) / deliveries_per_month)
+                total_cost += num_vehicles * vehicle['Custo fixo por mês']
+                
+                return {
+                    'routes': routes,
+                    'vehicles': {
+                        vehicle['Modal']: {
+                            'count': num_vehicles,
+                            'routes': routes
+                        }
+                    },
+                    'total_cost': total_cost
+                }
+            
+            return None
+
+    def optimize(self, fixed_fleet=None) -> Dict:
+        """
+        Otimiza a distribuição dos pontos de venda entre os CDs.
+        
+        Args:
+            fixed_fleet: DataFrame com a frota fixa definida pelo usuário (para cenário atual)
+        """
+        try:
+            # Prepara os dados para clusterização
+            X = self.pdv_data[['latitude', 'longitude']].values
+            
+            # Inicializa o modelo de clusterização
+            kmeans = KMeans(n_clusters=len(self.cd_data))
+            
+            # Realiza a clusterização
+            clusters = kmeans.fit_predict(X)
+            
+            # Cria os centros de distribuição
+            self.distribution_centers = []
+            for i in range(len(self.cd_data)):
+                centroid = kmeans.cluster_centers_[i]
+                cd = DistributionCenter(
+                    latitude=centroid[0],
+                    longitude=centroid[1],
+                    size=self.cd_data.iloc[i]['Tipos de CD'],
+                    monthly_cost=self.cd_data.iloc[i]['Custo mensal']
+                )
+                self.distribution_centers.append(cd)
+            
+            # Inicializa contadores
+            transport_costs = 0
+            storage_costs = sum(cd.monthly_cost for cd in self.distribution_centers)
+            vehicle_counts = {vehicle['Modal']: 0 for _, vehicle in self.transport_data.iterrows()}
+            vehicle_routes = {vehicle['Modal']: 0 for _, vehicle in self.transport_data.iterrows()}
+            
+            # Armazena as soluções de roteamento para cada CD
+            routing_solutions = []
+            
+            # Calcula os custos de transporte
+            for i, cd in enumerate(self.distribution_centers):
+                # Encontra a fábrica mais próxima deste CD
+                closest_factory = min(self.factories, 
+                                    key=lambda f: self.calculate_distance(f.latitude, f.longitude, cd.latitude, cd.longitude))
+                
+                # Pontos de venda atribuídos a este CD
+                cluster_points = self.pdv_data[clusters == i]
+                
+                # Otimiza as rotas para este cluster
+                route_optimizer = RouteOptimizer(
+                    factory=closest_factory,
+                    distribution_center=cd,
+                    points_of_sale=cluster_points
                 )
                 
-                if routes:
-                    # Verifica se as rotas estão eficientes (média de paradas >= 3)
-                    avg_stops_per_route = sum(len(route) for route in routes) / len(routes)
-                    if avg_stops_per_route < 3:
-                        continue
-                    
-                    # Calcula custos
-                    total_cost = 0
-                    for route in routes:
-                        costs = route_optimizer.calculate_route_costs(vehicle, route)
-                        total_cost += costs['variable']
-                    
-                    # Adiciona custo fixo pelo número de veículos necessários
-                    deliveries_per_month = vehicle['Nº entrega por mês']
-                    num_vehicles = math.ceil(len(routes) / (deliveries_per_month))
-                    total_cost += num_vehicles * vehicle['Custo fixo por mês']
-                    
-                    # Retorna a solução
-                    return {
-                        'routes': routes,
-                        'vehicles': {
-                            vehicle['Modal']: {
-                                'count': num_vehicles,
-                                'routes': routes
-                            }
-                        },
-                        'total_cost': total_cost
-                    }
-        
-        # Se nenhum veículo funcionou com rotas eficientes, tenta novamente com critérios mais flexíveis
-        vehicle = vehicles.iloc[0]  # Pega o maior veículo
-        routes = route_optimizer.optimize_routes(
-            vehicle_capacity=vehicle['Capacidade por entrega (kg)'],
-            max_stops_per_day=8  # Mantém 8 paradas por rota
-        )
-        
-        if routes:
-            # Calcula custos
-            total_cost = 0
-            for route in routes:
-                costs = route_optimizer.calculate_route_costs(vehicle, route)
-                total_cost += costs['variable']
-            
-            # Adiciona custo fixo pelo número de veículos necessários
-            deliveries_per_month = vehicle['Nº entrega por mês']
-            num_vehicles = math.ceil(len(routes) / deliveries_per_month)
-            total_cost += num_vehicles * vehicle['Custo fixo por mês']
-            
-            return {
-                'routes': routes,
-                'vehicles': {
-                    vehicle['Modal']: {
-                        'count': num_vehicles,
-                        'routes': routes
-                    }
-                },
-                'total_cost': total_cost
-            }
-        
-        return None
-
-    def optimize(self) -> Dict:
-        """Otimiza a distribuição dos pontos de venda entre os CDs."""
-        # Prepara os dados para clusterização
-        X = self.pdv_data[['latitude', 'longitude']].values
-        
-        # Inicializa o modelo de clusterização
-        kmeans = KMeans(n_clusters=len(self.cd_data))
-        
-        # Realiza a clusterização
-        clusters = kmeans.fit_predict(X)
-        
-        # Cria os centros de distribuição
-        self.distribution_centers = []
-        for i in range(len(self.cd_data)):
-            centroid = kmeans.cluster_centers_[i]
-            cd = DistributionCenter(
-                latitude=centroid[0],
-                longitude=centroid[1],
-                size=self.cd_data.iloc[i]['Tipos de CD'],
-                monthly_cost=self.cd_data.iloc[i]['Custo mensal']
-            )
-            self.distribution_centers.append(cd)
-        
-        # Inicializa contadores
-        transport_costs = 0
-        storage_costs = sum(cd.monthly_cost for cd in self.distribution_centers)
-        vehicle_counts = {vehicle['Modal']: 0 for _, vehicle in self.transport_data.iterrows()}
-        vehicle_routes = {vehicle['Modal']: 0 for _, vehicle in self.transport_data.iterrows()}
-        
-        # Armazena as soluções de roteamento para cada CD
-        routing_solutions = []
-        
-        # Calcula os custos de transporte
-        for i, cd in enumerate(self.distribution_centers):
-            # Encontra a fábrica mais próxima deste CD
-            closest_factory = min(self.factories, 
-                                key=lambda f: self.calculate_distance(f.latitude, f.longitude, cd.latitude, cd.longitude))
-            
-            # Pontos de venda atribuídos a este CD
-            cluster_points = self.pdv_data[clusters == i]
-            
-            # Otimiza as rotas para este cluster
-            route_optimizer = RouteOptimizer(
-                factory=closest_factory,
-                distribution_center=cd,
-                points_of_sale=cluster_points
-            )
-            
-            # Encontra o melhor mix de veículos
-            solution = self.find_best_vehicle_mix(cluster_points, route_optimizer)
-            
-            if solution:
-                transport_costs += solution['total_cost']
-                # Atualiza contadores de veículos e rotas
-                for modal, info in solution['vehicles'].items():
-                    vehicle_counts[modal] += info['count']
-                    vehicle_routes[modal] += len(info['routes'])
+                # Encontra o melhor mix de veículos ou usa frota fixa
+                solution = self.find_best_vehicle_mix(
+                    cluster_points=cluster_points,
+                    route_optimizer=route_optimizer,
+                    fixed_fleet=fixed_fleet
+                )
                 
-                # Armazena a solução de roteamento
-                routing_solutions.append({
-                    'cd_index': i,
-                    'closest_factory': closest_factory,
-                    'cluster_points': cluster_points,
-                    'solution': solution
-                })
-        
-        # Calcula o custo total
-        total_cost = transport_costs + storage_costs
-        
-        # Armazena a solução
-        self.solution = {
-            'clusters': clusters,
-            'transport_costs': transport_costs,
-            'storage_costs': storage_costs,
-            'total_cost': total_cost,
-            'vehicles': vehicle_counts,
-            'routes_per_vehicle': {modal: routes for modal, routes in vehicle_routes.items() if routes > 0},
-            'routing_solutions': routing_solutions  # Armazena as soluções de roteamento
-        }
-        
-        return self.solution
+                if solution:
+                    transport_costs += solution['total_cost']
+                    # Atualiza contadores de veículos e rotas
+                    for modal, info in solution['vehicles'].items():
+                        vehicle_counts[modal] += info['count']
+                        vehicle_routes[modal] += len(info['routes'])
+                    
+                    # Armazena a solução de roteamento
+                    routing_solutions.append({
+                        'cd_index': i,
+                        'closest_factory': closest_factory,
+                        'cluster_points': cluster_points,
+                        'solution': solution
+                    })
+            
+            # Verifica se encontrou alguma solução
+            if not routing_solutions:
+                st.error("Não foi possível encontrar uma solução viável com os parâmetros fornecidos.")
+                return None
+            
+            # Calcula o custo total
+            total_cost = transport_costs + storage_costs
+            
+            # Armazena a solução
+            self.solution = {
+                'clusters': clusters,
+                'transport_costs': transport_costs,
+                'storage_costs': storage_costs,
+                'total_cost': total_cost,
+                'vehicles': vehicle_counts,
+                'routes_per_vehicle': {modal: routes for modal, routes in vehicle_routes.items() if routes > 0},
+                'routing_solutions': routing_solutions
+            }
+            
+            return self.solution
+            
+        except Exception as e:
+            st.error(f"Erro durante a otimização: {str(e)}")
+            return None
     
     def visualize_solution(self, solution: Dict) -> folium.Map:
         """Visualiza a solução em um mapa interativo."""
