@@ -1,0 +1,7 @@
+runtime: python39
+entrypoint: streamlit run app.py
+
+env_variables:
+  PORT: 8080
+
+instance_class: F1 
